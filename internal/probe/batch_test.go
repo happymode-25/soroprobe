@@ -2,8 +2,11 @@ package probe_test
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 
+	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -64,6 +67,7 @@ func TestCheckBatchContinuesPastAnErroredCheck(t *testing.T) {
 	assert.False(t, result.OK)
 	assert.True(t, result.Errored)
 	assert.NotEmpty(t, result.Items[0].Error)
+	assert.NotContains(t, result.Items[0].Error, "timed out", "an ordinary failure is not a timeout")
 	assert.Nil(t, result.Items[0].Result)
 	require.NotNil(t, result.Items[1].Result, "the next check still runs")
 	assert.True(t, result.Items[1].Result.OK)
@@ -82,6 +86,12 @@ func TestCheckBatchRejectsMalformedBatches(t *testing.T) {
 	durability := named("x", stellartest.SACContract, "")
 	durability.DataDurability = "temp"
 
+	badTimeout := named("t", stellartest.SACContract, "")
+	badTimeout.Timeout = "soon"
+
+	negativeTimeout := named("n", stellartest.SACContract, "")
+	negativeTimeout.Timeout = "-1s"
+
 	tests := map[string]probe.BatchRequest{
 		"empty":            {},
 		"too many":         {Checks: tooMany},
@@ -89,6 +99,8 @@ func TestCheckBatchRejectsMalformedBatches(t *testing.T) {
 		"duplicate names":  {Checks: []probe.NamedCheck{named("x", stellartest.SACContract, ""), named("x", stellartest.WasmContract, "")}},
 		"default dup name": {Checks: []probe.NamedCheck{named("", stellartest.SACContract, ""), named("", stellartest.SACContract, "decimals")}},
 		"bad durability":   {Checks: []probe.NamedCheck{durability}},
+		"bad timeout":      {Checks: []probe.NamedCheck{badTimeout}},
+		"negative timeout": {Checks: []probe.NamedCheck{negativeTimeout}},
 	}
 	for name, req := range tests {
 		_, err := p.CheckBatch(context.Background(), req)
@@ -106,4 +118,86 @@ func TestCheckBatchStopsOnCancel(t *testing.T) {
 	_, err := p.CheckBatch(ctx, probe.BatchRequest{Checks: []probe.NamedCheck{named("a", stellartest.SACContract, "")}})
 	assert.ErrorIs(t, err, context.Canceled)
 	assert.Empty(t, fake.EntryRequests, "a cancelled batch sends nothing")
+}
+
+// hungClient makes the first GetLedgerEntries call block until its context is
+// done, modelling an upstream that never answers. Later calls reach the
+// fixtures, so the batch can be shown to keep going after a check times out.
+type hungClient struct {
+	*stellartest.Fake
+	hangOnce sync.Once
+}
+
+func (c *hungClient) GetLedgerEntries(ctx context.Context, req protocol.GetLedgerEntriesRequest) (protocol.GetLedgerEntriesResponse, error) {
+	var hang bool
+	c.hangOnce.Do(func() { hang = true })
+	if !hang {
+		return c.Fake.GetLedgerEntries(ctx, req)
+	}
+	<-ctx.Done()
+	return protocol.GetLedgerEntriesResponse{}, ctx.Err()
+}
+
+func TestCheckBatchPerCheckTimeoutContinuesPastTheHungCheck(t *testing.T) {
+	t.Parallel()
+
+	p, err := probe.New(probe.Options{
+		Client:        &hungClient{Fake: stellartest.NewFake(t)},
+		SourceAccount: stellartest.SourceAccount,
+		Thresholds:    health.DefaultThresholds,
+	})
+	require.NoError(t, err)
+
+	hung := named("hung", stellartest.WasmContract, "decimals")
+	hung.Timeout = "50ms"
+
+	result, err := p.CheckBatch(context.Background(), probe.BatchRequest{Checks: []probe.NamedCheck{
+		hung,
+		named("next", stellartest.SACContract, "decimals"),
+	}})
+	require.NoError(t, err, "a check that times out is a result, not a batch failure")
+
+	assert.False(t, result.OK)
+	assert.True(t, result.Errored)
+	require.Len(t, result.Items, 2)
+	assert.Nil(t, result.Items[0].Result)
+	assert.Contains(t, result.Items[0].Error, "timed out after 50ms")
+	require.NotNil(t, result.Items[1].Result, "the batch continues past a timeout")
+	assert.True(t, result.Items[1].Result.OK)
+}
+
+// deadClient never answers and ignores the context it is given, standing in for
+// the live JSON-RPC transport, which posts with an uncontexted request and so
+// cannot be interrupted once a call is in flight.
+type deadClient struct {
+	*stellartest.Fake
+}
+
+func (c *deadClient) GetLedgerEntries(context.Context, protocol.GetLedgerEntriesRequest) (protocol.GetLedgerEntriesResponse, error) {
+	select {} // stays blocked; the abandoned goroutine ends with the test binary
+}
+
+func TestCheckBatchPerCheckTimeoutBoundsAnUninterruptibleCall(t *testing.T) {
+	t.Parallel()
+
+	p, err := probe.New(probe.Options{
+		Client:        &deadClient{Fake: stellartest.NewFake(t)},
+		SourceAccount: stellartest.SourceAccount,
+		Thresholds:    health.DefaultThresholds,
+	})
+	require.NoError(t, err)
+
+	slow := named("slow", stellartest.WasmContract, "")
+	slow.Timeout = "50ms"
+
+	start := time.Now()
+	result, err := p.CheckBatch(context.Background(), probe.BatchRequest{Checks: []probe.NamedCheck{slow}})
+	require.NoError(t, err)
+
+	assert.Less(t, time.Since(start), 5*time.Second,
+		"the batch returns at the per-check deadline, not after the RPC timeout")
+	assert.True(t, result.Errored)
+	require.Len(t, result.Items, 1)
+	assert.Nil(t, result.Items[0].Result)
+	assert.Contains(t, result.Items[0].Error, "timed out after 50ms")
 }
