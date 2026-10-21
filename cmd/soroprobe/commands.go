@@ -93,6 +93,7 @@ Nothing is submitted and no signing takes place.
 
 func newInspectCmd(opts *options) *cobra.Command {
 	var dataKeys []string
+	var keyFile string
 	var durability string
 	var reportPath string
 
@@ -106,6 +107,11 @@ Stellar RPC reads ledger entries by key and cannot enumerate a contract's data
 entries, so data entries must be named explicitly with --key. Listing every
 entry a contract owns requires an indexer, which SoroProbe deliberately does not
 depend on.
+
+--key-file reads the same specs from a file, one per line, for contracts with
+too many entries for a command line. Keys from the file and from --key are
+combined; an invalid line is reported with its line number before any request
+is sent.
 
 ` + argHelp,
 		Args: cobra.ExactArgs(1),
@@ -121,6 +127,11 @@ depend on.
 			}
 			defer report.close()
 
+			keys, err := mergeKeys(keyFile, dataKeys)
+			if err != nil {
+				return err
+			}
+
 			p, cleanup, err := opts.prober()
 			if err != nil {
 				return err
@@ -129,7 +140,7 @@ depend on.
 
 			result, err := p.Inspect(cmd.Context(), probe.InspectRequest{
 				ContractID:     args[0],
-				DataKeys:       dataKeys,
+				DataKeys:       keys,
 				DataDurability: d,
 			})
 			if err != nil {
@@ -148,6 +159,7 @@ depend on.
 	}
 
 	cmd.Flags().StringArrayVar(&dataKeys, "key", nil, "a contract data key to inspect, in type:value form (repeatable)")
+	cmd.Flags().StringVar(&keyFile, "key-file", "", "a file listing data keys to inspect, one spec per line (blank lines and # comments ignored)")
 	cmd.Flags().StringVar(&durability, "durability", "persistent", "durability for --key lookups: persistent or temporary")
 	cmd.Flags().StringVar(&reportPath, "report", "", "write the JSON result to this file while printing text as usual")
 	return cmd
@@ -157,6 +169,7 @@ func newCheckCmd(opts *options) *cobra.Command {
 	var function string
 	var callArgs []string
 	var dataKeys []string
+	var keyFile string
 	var durability string
 	var file string
 	var checkTimeout time.Duration
@@ -176,6 +189,11 @@ extend the entry, not a reason to break a pipeline.
 --fn is optional. SoroProbe cannot discover a contract's exported functions, and
 guessing one would produce a misleading failure, so the simulation step is
 reported as skipped unless a function is named.
+
+--key and --key-file name data entries for the TTL check. --key-file reads one
+spec per line from a file, ignoring blank lines and lines starting with #, and
+combines them with --key. It applies to the single-contract form; --file
+entries carry their own data_keys.
 
 --file runs many checks at once, from a JSON file ("-" for stdin):
 
@@ -199,6 +217,9 @@ artifact. The file is written even when the check fails.`,
 				if len(args) > 0 {
 					return fmt.Errorf("give a contract ID or --file, not both")
 				}
+				if keyFile != "" {
+					return fmt.Errorf("give --key-file with a contract ID, not with --file")
+				}
 				return nil
 			}
 			return cobra.ExactArgs(1)(cmd, args)
@@ -219,6 +240,11 @@ artifact. The file is written even when the check fails.`,
 				return err
 			}
 
+			keys, err := mergeKeys(keyFile, dataKeys)
+			if err != nil {
+				return err
+			}
+
 			p, cleanup, err := opts.prober()
 			if err != nil {
 				return err
@@ -229,7 +255,7 @@ artifact. The file is written even when the check fails.`,
 				ContractID:     args[0],
 				Function:       function,
 				Args:           callArgs,
-				DataKeys:       dataKeys,
+				DataKeys:       keys,
 				DataDurability: d,
 			})
 			if err != nil {
@@ -262,6 +288,7 @@ artifact. The file is written even when the check fails.`,
 	cmd.Flags().StringVar(&function, "fn", "", "read-only function to simulate as a liveness probe")
 	cmd.Flags().StringArrayVar(&callArgs, "arg", nil, "argument for --fn, in type:value form (repeatable)")
 	cmd.Flags().StringArrayVar(&dataKeys, "key", nil, "a contract data key to include in the TTL check (repeatable)")
+	cmd.Flags().StringVar(&keyFile, "key-file", "", "a file listing data keys for the TTL check, one spec per line (blank lines and # comments ignored)")
 	cmd.Flags().StringVar(&durability, "durability", "persistent", "durability for --key lookups: persistent or temporary")
 	cmd.Flags().StringVarP(&file, "file", "f", "", `run every check listed in this JSON file ("-" for stdin)`)
 	cmd.Flags().DurationVar(&checkTimeout, "check-timeout", 0,

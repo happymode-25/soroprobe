@@ -245,6 +245,7 @@ Reads the contract's instance and code entries and reports expiration health.
 | Flag | Description |
 | --- | --- |
 | `--key <spec>` | A contract data key to inspect, in `type:value` form. Repeatable. |
+| `--key-file <path>` | A file listing data keys, one spec per line. Blank lines and `#` comment lines are ignored. |
 | `--durability <d>` | Durability for `--key` lookups: `persistent` (default) or `temporary`. |
 | `--report <path>` | Also write the JSON result to this file, for a CI artifact. |
 
@@ -252,6 +253,24 @@ Stellar RPC reads ledger entries **by key** and offers no way to enumerate the
 data entries a contract owns. Listing them all would require an indexer, which a
 stateless tool has no business depending on — so data entries you care about are
 named explicitly with `--key`.
+
+**Many entries?** `--key-file` reads the same specs from a file, so a CI job
+does not have to repeat a long command line:
+
+```
+# keys.txt — one spec per line, blank lines and # comment lines ignored
+sym:Balance
+sym:Admin
+u32:7
+```
+
+```
+$ soroprobe inspect C… --key-file keys.txt
+```
+
+Keys from the file and from `--key` are combined, duplicates dropped, and an
+invalid line fails immediately — reported with its line number, before any
+request is sent.
 
 ### `soroprobe check <contract-id>`
 
@@ -262,6 +281,7 @@ Combined health check, designed for CI.
 | `--fn <name>` | A read-only function to simulate as a liveness probe. |
 | `--arg <spec>` | Argument for `--fn`, in `type:value` form. Repeatable. |
 | `--key <spec>` | A contract data key to include in the TTL check. Repeatable. |
+| `--key-file <path>` | A file listing data keys, one spec per line. Combined with `--key`. |
 | `--durability <d>` | Durability for `--key` lookups. |
 | `--report <path>` | Also write the JSON result to this file, for a CI artifact. |
 
