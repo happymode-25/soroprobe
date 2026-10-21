@@ -42,7 +42,9 @@ Prefer explicit prefixes. A contract expecting u32 will fail confusingly if it
 is handed an inferred i128.`
 
 func newSimulateCmd(opts *options) *cobra.Command {
-	return &cobra.Command{
+	var reportPath string
+
+	cmd := &cobra.Command{
 		Use:   "simulate <contract-id> <function> [args...]",
 		Short: "Simulate a contract invocation and report its result and cost",
 		Long: `Build a contract invocation, simulate it against the network, and report
@@ -53,6 +55,12 @@ Nothing is submitted and no signing takes place.
 ` + argHelp,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			report, err := openReport(reportPath)
+			if err != nil {
+				return err
+			}
+			defer report.close()
+
 			p, cleanup, err := opts.prober()
 			if err != nil {
 				return err
@@ -68,17 +76,25 @@ Nothing is submitted and no signing takes place.
 				return err
 			}
 
+			if err := report.write(result); err != nil {
+				return err
+			}
+
 			if opts.jsonOut {
 				return writeJSON(cmd.OutOrStdout(), result)
 			}
 			return renderSimulate(cmd.OutOrStdout(), result)
 		},
 	}
+
+	cmd.Flags().StringVar(&reportPath, "report", "", "write the JSON result to this file while printing text as usual")
+	return cmd
 }
 
 func newInspectCmd(opts *options) *cobra.Command {
 	var dataKeys []string
 	var durability string
+	var reportPath string
 
 	cmd := &cobra.Command{
 		Use:   "inspect <contract-id>",
@@ -99,6 +115,12 @@ depend on.
 				return err
 			}
 
+			report, err := openReport(reportPath)
+			if err != nil {
+				return err
+			}
+			defer report.close()
+
 			p, cleanup, err := opts.prober()
 			if err != nil {
 				return err
@@ -114,6 +136,10 @@ depend on.
 				return err
 			}
 
+			if err := report.write(result); err != nil {
+				return err
+			}
+
 			if opts.jsonOut {
 				return writeJSON(cmd.OutOrStdout(), result)
 			}
@@ -123,6 +149,7 @@ depend on.
 
 	cmd.Flags().StringArrayVar(&dataKeys, "key", nil, "a contract data key to inspect, in type:value form (repeatable)")
 	cmd.Flags().StringVar(&durability, "durability", "persistent", "durability for --key lookups: persistent or temporary")
+	cmd.Flags().StringVar(&reportPath, "report", "", "write the JSON result to this file while printing text as usual")
 	return cmd
 }
 
@@ -133,6 +160,7 @@ func newCheckCmd(opts *options) *cobra.Command {
 	var durability string
 	var file string
 	var checkTimeout time.Duration
+	var reportPath string
 
 	cmd := &cobra.Command{
 		Use:   "check <contract-id> | check --file <checks.json>",
@@ -161,7 +189,11 @@ and timeout — the same body POST /v1/checks accepts. timeout bounds a single
 check, as a Go duration string ("45s"); a check that outlives it is reported as
 one that could not run, and the batch continues. --check-timeout supplies the
 default for entries that name none. With --file, the exit code is 2 if any
-check could not run, else 1 if any failed, else 0.`,
+check could not run, else 1 if any failed, else 0.
+
+--report writes the JSON result to a file while the text report still goes to
+the terminal, so a CI run can keep readable logs and a machine-readable
+artifact. The file is written even when the check fails.`,
 		Args: func(cmd *cobra.Command, args []string) error {
 			if file != "" {
 				if len(args) > 0 {
@@ -172,8 +204,14 @@ check could not run, else 1 if any failed, else 0.`,
 			return cobra.ExactArgs(1)(cmd, args)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			report, err := openReport(reportPath)
+			if err != nil {
+				return err
+			}
+			defer report.close()
+
 			if file != "" {
-				return runCheckFile(cmd, opts, file, checkTimeout)
+				return runCheckFile(cmd, opts, file, checkTimeout, report)
 			}
 
 			d, err := parseDurability(durability)
@@ -195,6 +233,12 @@ check could not run, else 1 if any failed, else 0.`,
 				DataDurability: d,
 			})
 			if err != nil {
+				return err
+			}
+
+			// Write the report before deciding the exit code, so a failed
+			// check still leaves its report behind for the CI artifact.
+			if err := report.write(result); err != nil {
 				return err
 			}
 
@@ -222,11 +266,12 @@ check could not run, else 1 if any failed, else 0.`,
 	cmd.Flags().StringVarP(&file, "file", "f", "", `run every check listed in this JSON file ("-" for stdin)`)
 	cmd.Flags().DurationVar(&checkTimeout, "check-timeout", 0,
 		`default time limit for each check in --file; a per-entry "timeout" wins (0 means no limit)`)
+	cmd.Flags().StringVar(&reportPath, "report", "", "write the JSON result to this file while printing text as usual")
 	return cmd
 }
 
 // runCheckFile runs a batch of checks read from path.
-func runCheckFile(cmd *cobra.Command, opts *options, path string, checkTimeout time.Duration) error {
+func runCheckFile(cmd *cobra.Command, opts *options, path string, checkTimeout time.Duration, report *reportFile) error {
 	req, err := readBatch(cmd.InOrStdin(), path)
 	if err != nil {
 		return err
@@ -241,6 +286,12 @@ func runCheckFile(cmd *cobra.Command, opts *options, path string, checkTimeout t
 
 	result, err := p.CheckBatch(cmd.Context(), req)
 	if err != nil {
+		return err
+	}
+
+	// Write the report before deciding the exit code, so a failed batch still
+	// leaves its report behind for the CI artifact.
+	if err := report.write(result); err != nil {
 		return err
 	}
 
